@@ -12,6 +12,7 @@ session.on('change', function(userCtx) {
   nedm.set_user_name(userCtx);
   nedm.update_buttons();
   //nedm.update_header();
+  nedm.buildDBList();
 });
 
 
@@ -42,8 +43,6 @@ require("db").guessCurrent = function (loc) {
     return null;
 };
 
-nedm.open_changes_feeds = {};
-
 nedm.build_url = function(options) {
     var url = ""; 
 
@@ -52,37 +51,45 @@ nedm.build_url = function(options) {
         if (!first) url += "&";
         else url = "?";
         first = false;
-        url += key + "=" + options[key];
+        url += key + "=";
+        if (typeof options[key] === 'string') url += options[key];
+        else url += JSON.stringify(options[key]);
     }
     return encodeURI(url);
 }
+
+nedm.open_changes_feeds = { taglist: {}, urllist: {}};
 
 nedm.listen_to_changes_feed = function(db, tag, callback, options) {
     options.feed = "eventsource";
     var url = db.url + "/_changes" + nedm.build_url(options);
 
-    if (!(url in nedm.open_changes_feeds)) {
+    if (!(url in nedm.open_changes_feeds.urllist)) {
         // start a new listener
         var listener = new EventSource(url);
-        nedm.open_changes_feeds[url] = [listener, {}];
+        nedm.open_changes_feeds.urllist[url] = {src: listener, taglist: {}};
 
     }
-    nedm.open_changes_feeds[url][1][tag] = callback; 
-    nedm.open_changes_feeds[url][0].addEventListener("message", callback, false); 
+    if (tag in nedm.open_changes_feeds.taglist) {
+        console.log("Warning: removing tag '" + tag +"'");
+        nedm.cancel_changes_feed(db, tag)
+    }
+    nedm.open_changes_feeds.taglist[tag] = {callb: callback, url: url}; 
+    nedm.open_changes_feeds.urllist[url].src.addEventListener("message", callback, false); 
+    nedm.open_changes_feeds.urllist[url].taglist[tag] = {};
 }
 
-nedm.cancel_changes_feed = function(db, tag, options) {
+nedm.cancel_changes_feed = function(db, tag) {
 
-    options.feed = "eventsource";
-    var url = db.url + "/_changes" + nedm.build_url(options);
-    if (!(url in nedm.open_changes_feeds)) return; 
+    if (!(tag in nedm.open_changes_feeds.taglist)) return; 
     
-    if (!(tag in nedm.open_changes_feeds[url][1])) return;
+    var obj = nedm.open_changes_feeds.taglist[tag]; 
+    var src = nedm.open_changes_feeds.urllist[obj.url].src;
+    
+    src.removeEventListener("message", obj.callb, false); 
 
-    var src = nedm.open_changes_feeds[url][0];
-    var callb = nedm.open_changes_feeds[url][1][tag];
-    src.removeEventListener("message", callb, false); 
-    delete nedm.open_changes_feeds[url][1][tag];
+    delete nedm.open_changes_feeds.urllist[obj.url].taglist[tag];
+    delete nedm.open_changes_feeds.taglist[tag];
 }
 
 
@@ -122,9 +129,13 @@ nedm.update_db_interface = function(db) {
         if (!options.keys) options.keys = {};
         if (!options.opts) options.opts = {};
         var viewname = this.encode(view);
+        var theType = "POST";
         try {
             var data = JSON.stringify(options.keys);
-            if (options.keys == {}) data = "";
+            if ($.isEmptyObject(options.keys)) {
+                data = "";
+                theType = "GET";
+            }
         }
         catch (e) {
             return callback(e);
@@ -134,7 +145,7 @@ nedm.update_db_interface = function(db) {
                 '/_design/' + this.encode(name) +
                 '/_view/' + viewname + nedm.build_url(options.opts),
             data: data,
-            type: "POST",
+            type: theType 
         };
         this.request(req, callback);
     };
@@ -144,8 +155,8 @@ nedm.update_db_interface = function(db) {
         return nedm.listen_to_changes_feed(this, tag, callback, options);
     }
 
-    db.cancel_changes_feed = function(tag, options) {
-        return nedm.cancel_changes_feed(this, tag, callback);
+    db.cancel_changes_feed = function(tag) {
+        return nedm.cancel_changes_feed(this, tag);
     }
 
 
@@ -348,12 +359,183 @@ nedm.buildDBList = function(ev, id) {
            html    += '</ul></div>';
            totalhtml += nedm.compile(html)(dbs[key]);     
        }
-       if (totalhtml == '') return;
   
-       $("#" + x.target.id + " .listofdbs").append(totalhtml);
-       $("#" + x.target.id + " .listofdbs").trigger("create");
+       if (x == null) {
+           // Means we have no specific event, change them all
+           $(".listofdbs").empty();
+           $(".listofdbs").append(totalhtml);
+           $(".listofdbs").trigger("create");
+       } else {
+           $("#" + x.target.id + " .listofdbs").empty();
+           $("#" + x.target.id + " .listofdbs").append(totalhtml);
+           $("#" + x.target.id + " .listofdbs").trigger("create");
+       }
    }}(ev,id)); 
 }
+
+nedm.dateFromKey = function(arr) {
+  return new Date(Date.UTC.apply(this, arr));
+}
+
+nedm.MonitoringGraph = function (adiv, data_name, since_time_in_secs) {
+
+    this.data = [];
+    this.graph = new dygraphs.Dygraph(adiv, this.data,
+          {
+            drawPoints: true,
+              showRoller: false,
+              labels: ['Time'].concat(data_name),
+              connectSeparatedPoints: true,
+              xAxisLabelWidth: 60
+          });
+
+    this.name = data_name;
+ 
+    this.changeBeginningTime(since_time_in_secs);
+    this.uuid = Math.random().toString(36).substr(2,9);
+};
+
+nedm.MonitoringGraph.prototype.prependData = function(r) {
+     for (var i=0;i<r.length;i++) { 
+         this.data.unshift(r[i]);
+     }
+};
+
+nedm.MonitoringGraph.prototype.update = function() {
+     this.graph.updateOptions( { 'file': this.data, 'labels' : ['Time'].concat(this.name) } );
+}
+
+nedm.MonitoringGraph.prototype.dataFromKeyVal = function(obj) {
+    var outp = [ nedm.dateFromKey(obj.key) ];
+    var seen = false;
+    var data_name = this.name;
+    for (var i=0;i<data_name.length;i++) {
+        if (data_name[i] in obj.value) {
+            outp.push(obj.value[data_name[i]][0]);
+            seen = true;
+        } else outp.push(null);
+    }
+    if (!seen) return null;
+    return outp; 
+}
+
+nedm.MonitoringGraph.prototype.appendData = function(r) {
+     var append = 0;
+     for (var i=0;i<r.length;i++) { 
+         this.data.push(r[i]);
+         append++;
+     }
+     return append;
+};
+
+nedm.MonitoringGraph.prototype.addDataName = function(aname, since_time_in_secs, callback) {
+    if (this.name.indexOf(aname) != -1 ) return;
+    this.name.push(aname);
+    this.data.length = 0;
+    this.changeBeginningTime(since_time_in_secs, callback);
+}
+
+nedm.MonitoringGraph.prototype.removeBeforeDate = function(adate) {
+    var data = this.data;
+    if (data.length == 0) return 0;
+    var j = 0;
+    while (j < data.length && data[j][0].getTime() < adate.getTime()) j++; 
+    return data.splice(0, j);
+}
+
+nedm.MonitoringGraph.prototype.changeBeginningTime = function (since_time_in_secs, callback) {
+
+    this.time_prev = since_time_in_secs; 
+    var time_before_now = new Date((new Date).getTime() - since_time_in_secs*1000);
+    var data = this.data;
+    if (this.removeBeforeDate(time_before_now) == 0) {
+        // first determine what the earliest date is
+        var last_key = [9999];
+        if (data.length > 0) {
+            var then = data[0][0];
+            last_key = [
+                     then.getUTCFullYear(), then.getUTCMonth(), 
+                     then.getUTCDate(), then.getUTCHours(), 
+                     then.getUTCMinutes(), then.getUTCSeconds()-1];
+        }
+        first_key = [ 
+                     time_before_now.getUTCFullYear(), time_before_now.getUTCMonth(), 
+                     time_before_now.getUTCDate(), time_before_now.getUTCHours(), 
+                     time_before_now.getUTCMinutes(), time_before_now.getUTCSeconds()];
+
+        db.current().getView("erlang", "slow_control_time_label", 
+                { opts : { group_level : 9, descending: true, reduce : true,
+                  startkey : last_key, endkey : first_key} },
+                function(obj, cbck) { return function(e, o) { 
+                    if (e != null) return;
+                    var all_data = o.rows.map(obj.dataFromKeyVal, obj).filter( function(o) { 
+                        if (o != null) return true;
+                        return false; 
+                    });
+                    obj.prependData(all_data); 
+                    obj.update(); 
+                    if (cbck) cbck();
+                } 
+                } (this, callback));
+    } else {
+        this.update();
+        if (callback) callback();
+    }
+
+};
+
+nedm.MonitoringGraph.prototype.getMostRecentValues = function() {
+
+}
+
+nedm.MonitoringGraph.prototype.processChange = function(err, obj) {
+     if (err != null) return;
+     var app = 0;
+     for (var i=0;i<obj.rows.length;i++ ) {
+         var ind = this.name.indexOf(obj.rows[i].key) + 1;
+         if (ind == 0) continue;
+         var o = obj.rows[i].value;
+         var d = new Date(Date.parse(o.timestamp));
+         var j=this.data.length-1;
+         while( j >= 0 && this.data[j][0] > d) j--; 
+
+         // j is now the event, or before
+         if (j>=0 && this.data[j][0].getTime() == d.getTime()) this.data[j][ind] = parseFloat(o.value);
+         else {
+            // Insert it, this also handles the case when nothing is there
+            this.data.splice(j+1, 0, [d].concat( Array.apply(null,new Array(this.name.length))
+                                                    .map(function() { return null; })
+                                              ));
+            this.data[j+1][ind] = parseFloat(o.value);
+            app++;
+         }
+     }
+     if (this.data.length != 0) { 
+         var time_before_now = new Date(this.data[this.data.length-1][0].getTime() - this.time_prev*1000);
+         this.removeBeforeDate(time_before_now);
+     }
+     this.update();
+};
+
+nedm.MonitoringGraph.prototype.syncFunction = function () {
+    db.current().getView('erlang', 'latest_value', 
+      { opts : {group : true}, keys : {keys : this.name} }, 
+      function(o) { return function(err, objs) {  
+           o.processChange(err,objs); 
+        } }(this));
+};
+
+nedm.MonitoringGraph.prototype.beginListening = function () {
+  this.endListening(); 
+  db.current().listen_to_changes_feed(this.uuid, 
+          function(o) { return function(err, obj) { o.syncFunction(err,obj); } } (this), 
+          {since : 'now', filter : 'nedm_default/doc_type', type : "data"});
+};
+
+nedm.MonitoringGraph.prototype.endListening = function () {
+  db.current().cancel_changes_feed(this.uuid);
+};
+
 
 
 $(document).on('mobileinit', function() {
